@@ -7,46 +7,47 @@ const rateLimit = require('express-rate-limit');
 const app = express();
 const server = http.createServer(app);
 
+// Rate limiting middleware
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // Limit each IP to 100 requests per windowMs
+  max: 100, // Limit each IP to 100 requests per window
 });
 
 app.use(limiter);
+app.use(express.json());
+
+// CORS setup
+const allowedOrigins = [
+  'http://localhost:5173',
+  'https://brainiacquiz.netlify.app',
+];
 
 app.use(cors({
-  origin: ['http://localhost:5173', 'https://brainiacquiz.netlify.app'], // Add your frontend URLs
+  origin: function (origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    return callback(new Error('Not allowed by CORS'));
+  },
   methods: ['GET', 'POST'],
   credentials: true,
 }));
-app.use(express.json()); // Middleware to parse JSON request bodies
 
-// Initialize Socket.IO
+// Socket.io setup
 const io = new Server(server, {
   cors: {
-    origin: 'http://localhost:5173', // Allow requests from your React app
+    origin: allowedOrigins,
     methods: ['GET', 'POST'],
   },
 });
 
-// In-memory leaderboard data
-let leaderboard = [
-  {
-    "id": 1,
-    "name": "John Doe",
-    "school": "Example School",
-    "score": 15,
-    "timeUsed": 120,
-    "avatar": "https://example.com/avatar.jpg",
-    "likes": 5,
-    "liked": false
-  }
-];
+// In-memory leaderboard (empty at the start)
+let leaderboard = [];
 
-// API to get leaderboard data
+// GET leaderboard (pagination for display)
 app.get('/leaderboard', (req, res) => {
   const page = parseInt(req.query.page) || 1;
-  const limit = 100;
+  const limit = 10; // Change the limit based on your needs
   const startIndex = (page - 1) * limit;
   const endIndex = startIndex + limit;
 
@@ -54,88 +55,86 @@ app.get('/leaderboard', (req, res) => {
   res.json(paginatedPlayers);
 });
 
-// API to submit a new score
+// POST a new score (when a player completes a quiz)
 app.post('/leaderboard', (req, res) => {
-  const { name, school, class: playerClass, score, timeUsed } = req.body;
+  const { playerId, name, school, playerClass, score, timeUsed } = req.body;
 
-  if (!name || !school || !playerClass || score === undefined || timeUsed === undefined) {
+  if (!playerId || !name || !school || !playerClass || score === undefined || timeUsed === undefined) {
     return res.status(400).json({ error: 'All fields are required' });
   }
 
-  // Add the new score to the leaderboard
-  leaderboard.push({ name, school, class: playerClass, score, timeUsed });
+  // Check if player exists, if so update their score, else create new player
+  let player = leaderboard.find(p => p.id === playerId);
 
-  // Emit the new score to all connected clients
-  io.emit('new_score', { name, school, class: playerClass, score, timeUsed });
+  if (player) {
+    // Update existing player's score
+    player.score = score;
+    player.timeUsed = timeUsed;
+  } else {
+    // Create a new player entry
+    player = {
+      id: playerId,
+      name,
+      school,
+      class: playerClass,
+      score,
+      timeUsed,
+      avatar: `https://api.dicebear.com/7.x/adventurer/svg?seed=${name.split(' ')[0]}`,
+      likes: 0,
+      liked: false,
+    };
 
-  res.status(201).json({ message: 'Score submitted successfully!' });
+    leaderboard.push(player);
+  }
+
+  // Emit the updated leaderboard to all connected clients
+  io.emit('update_leaderboard', leaderboard);
+
+  res.status(201).json({ message: 'Score submitted successfully!', player });
 });
 
-// API to handle likes
+// POST to like/unlike a player
 app.post('/leaderboard/like', (req, res) => {
-  const { id } = req.body;
+  const { playerId, liked } = req.body;
 
-  if (!id) {
+  if (!playerId) {
     return res.status(400).json({ error: 'Player ID is required' });
   }
 
-  const player = leaderboard.find((player) => player.id === id);
+  const player = leaderboard.find(p => p.id === playerId);
+
   if (player) {
-    player.likes += 1;
-    player.liked = true;
-    return res.status(200).json({ message: 'Like added successfully!', player });
+    player.likes += liked ? 1 : -1; // Increment or decrement likes
+    player.liked = liked;
+
+    // Emit updated likes to all clients
+    io.emit('update_likes', { id: player.id, likes: player.likes });
+
+    return res.status(200).json({ message: `Like ${liked ? 'added' : 'removed'}`, player });
   }
 
-  res.status(404).json({ error: 'Player not found' });
+  return res.status(404).json({ error: 'Player not found' });
 });
 
-// API to handle unlikes
-app.post('/leaderboard/unlike', (req, res) => {
-  const { id } = req.body;
-
-  if (!id) {
-    return res.status(400).json({ error: 'Player ID is required' });
-  }
-
-  const player = leaderboard.find((player) => player.id === id);
-  if (player) {
-    player.likes = Math.max(0, player.likes - 1);
-    player.liked = false;
-    return res.status(200).json({ message: 'Like removed successfully!', player });
-  }
-
-  res.status(404).json({ error: 'Player not found' });
-});
-
-// Handle WebSocket connections
+// WebSocket events
 io.on('connection', (socket) => {
   console.log('A user connected');
 
-  // Handle joining a room
-  socket.on('join_room', (room) => {
-    socket.join(room);
-    console.log(`User joined room: ${room}`);
-  });
+  // Emit the current leaderboard to newly connected clients
+  socket.emit('update_leaderboard', leaderboard);
 
-  // Handle sending messages
-  socket.on('send_message', (data) => {
-    io.to(data.room).emit('receive_message', { message: data.message });
-  });
-
-  // Handle disconnection
   socket.on('disconnect', () => {
     console.log('A user disconnected');
   });
 });
 
-// Define a route for the root URL
+// Root endpoint
 app.get('/', (req, res) => {
   res.send('Backend server is running!');
 });
 
-// Start the server
-const PORT = process.env.PORT || 4000; // Use the PORT environment variable or default to 4000
-
+// Start server
+const PORT = process.env.PORT || 4000;
 server.listen(PORT, () => {
   console.log(`Server is running on http://localhost:${PORT}`);
 });
